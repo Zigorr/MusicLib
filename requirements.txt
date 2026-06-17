@@ -1,0 +1,4 @@
+mutagen
+lrclibapi
+musicbrainzngs
+syncedlyrics
