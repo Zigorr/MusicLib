@@ -46,7 +46,3 @@ MusicLib/
 - Pull additional metadata sources (album art, genre, release info) beyond lyrics
 - Support duplicate detection before transfer
 - Add a simple CLI or config file for customizing library folder structure
-
-## About me
-
-Built by [Ziad Sameh](https://github.com/Zigorr) — full-stack and agentic AI developer, and an audiophile who wanted his music library to be as well-organized as his code.
