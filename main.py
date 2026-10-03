@@ -1,6 +1,3 @@
-import logging
-logging.getLogger("syncedlyrics").setLevel(logging.CRITICAL)
-
 from directory_transfer import directory_transfer
 from metadata_enrichment import metadata_enrichment
 from metadata_moving import metadata_moving

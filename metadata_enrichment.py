@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import socket
@@ -41,6 +42,80 @@ def format_date(date_str):
     if len(parts) == 3 and len(parts[2]) == 4:
         return f"{parts[2]}-{parts[1]}-{parts[0]}"
     return clean
+
+
+_APOSTROPHE_TRANS = str.maketrans({
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u02bc": "'",
+    "`": "'",
+    "\u00b4": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+})
+_MARKS_RE = re.compile(r"[\u2122\u00ae]")
+_FEAT_GROUP_RE = re.compile(
+    r"\s*[([][^)\]]*\b(?:featuring|feat|ft)\b[^)\]]*[)\]]",
+    re.IGNORECASE,
+)
+
+
+def fold_title(text):
+    """Case, apostrophe, and trademark-insensitive title key."""
+    text = _MARKS_RE.sub(" ", text or "")
+    text = text.translate(_APOSTROPHE_TRANS).casefold()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _track_candidates(track):
+    recording = track.get("recording", {}) or {}
+    return [track.get("title", ""), recording.get("title", "")]
+
+
+def _match_kind(file_title, track):
+    folded = [fold_title(name) for name in _track_candidates(track)]
+    folded = [name for name in folded if name]
+    exact = fold_title(file_title)
+    base = fold_title(_FEAT_GROUP_RE.sub(" ", file_title or ""))
+    if exact and exact in folded:
+        return "exact"
+    if base and base != exact and base in folded:
+        return "base"
+    return None
+
+
+def _featured_names(title):
+    names = []
+    for group in _FEAT_GROUP_RE.findall(title or ""):
+        inner = group.strip(" ()[]")
+        inner = re.sub(r"^(?:featuring|feat|ft)\.?\s*", "", inner, flags=re.IGNORECASE)
+        for part in re.split(r"\s*(?:,|&|\band\b)\s*", inner, flags=re.IGNORECASE):
+            part = fold_title(part)
+            if part:
+                names.append(part)
+    return names
+
+
+def _credit_names(track):
+    names = []
+    for source in (track.get("recording") or {}, track):
+        for credit in source.get("artist-credit") or []:
+            if isinstance(credit, dict):
+                name = fold_title((credit.get("artist") or {}).get("name", ""))
+                if name:
+                    names.append(name)
+    return names
+
+
+def _features_match(file_title, track):
+    needed = _featured_names(file_title)
+    if not needed:
+        return False
+    credits = _credit_names(track)
+    return all(
+        any(name == credit or f" {name} " in f" {credit} " for credit in credits)
+        for name in needed
+    )
 
 
 def get_genres_from_artist(artist_id):
@@ -94,15 +169,15 @@ def get_release_data(artist, album):
         _release_cache[cache_key] = None
         return None
 
-    album_lower = album.lower().strip()
+    album_key = fold_title(album)
     best = None
     for r in release_list:
-        if r.get("title", "").lower().strip() == album_lower:
+        if fold_title(r.get("title", "")) == album_key:
             best = r
             break
     if not best:
         for r in release_list:
-            if album_lower in r.get("title", "").lower().strip():
+            if album_key and album_key in fold_title(r.get("title", "")):
                 best = r
                 break
     if not best:
@@ -221,35 +296,71 @@ def build_side_offsets(medium):
     return offsets
 
 
-def find_track_info(release, title):
-    title_lower = title.lower().strip()
-    medium_list = release.get("medium-list", [])
+def _iter_tracks(release):
     prior_tracks = 0
-    for medium in medium_list:
+    for medium in release.get("medium-list", []):
         track_list = medium.get("track-list", [])
         side_offsets = build_side_offsets(medium)
         for track in track_list:
-            recording = track.get("recording", {})
-            if recording.get("title", "").lower().strip() == title_lower:
-                raw = track.get("number", "")
-                position = track.get("position")
-
-                if position is not None:
-                    track_num = str(prior_tracks + int(position))
-                else:
-                    converted = vinyl_track_to_int(raw, side_offsets)
-                    if converted is not None:
-                        track_num = str(prior_tracks + converted)
-                    else:
-                        track_num = raw
-
-                artists = []
-                for credit in recording.get("artist-credit", []):
-                    if isinstance(credit, dict):
-                        artists.append(credit.get("artist", {}).get("name", ""))
-                return track_num, artists
+            yield prior_tracks, side_offsets, track
         prior_tracks += len(track_list)
-    return None, []
+
+
+def matching_tracks(release, title):
+    """Tracks whose title or recording title matches the file.
+
+    An exact folded match wins, including the same title listed twice. A title
+    that only matches once a featured-artist suffix is removed is used when the
+    feature is credited on that recording, or when only one track has that title.
+    """
+    exact = []
+    base = []
+    for item in _iter_tracks(release):
+        kind = _match_kind(title, item[2])
+        if kind == "exact":
+            exact.append(item)
+        elif kind == "base":
+            base.append(item)
+    if exact:
+        return exact
+    confirmed = [item for item in base if _features_match(title, item[2])]
+    if confirmed:
+        return confirmed
+    if len(base) == 1:
+        return base
+    return []
+
+
+def release_has_titles(release):
+    for _, _, track in _iter_tracks(release):
+        if any(fold_title(name) for name in _track_candidates(track)):
+            return True
+    return False
+
+
+def find_track_info(release, title):
+    matches = matching_tracks(release, title)
+    if not matches:
+        return None, []
+    prior_tracks, side_offsets, track = matches[0]
+    recording = track.get("recording", {})
+    raw = track.get("number", "")
+    position = track.get("position")
+
+    if position is not None:
+        track_num = str(prior_tracks + int(position))
+    else:
+        converted = vinyl_track_to_int(raw, side_offsets)
+        if converted is not None:
+            track_num = str(prior_tracks + converted)
+        else:
+            track_num = raw
+
+    artists = []
+    for credit in recording.get("artist-credit", []):
+        if isinstance(credit, dict):
+            artists.append(credit.get("artist", {}).get("name", ""))
+    return track_num, artists
 
 
 def metadata_enrichment(force=False):
@@ -324,17 +435,11 @@ def metadata_enrichment(force=False):
         release = data["release"]
         matched_title = release.get("title", "")
 
-        if matched_title.lower().strip() != album.lower().strip():
+        if fold_title(matched_title) != fold_title(album):
             print(f"         MISMATCH: file has \"{album}\" but MusicBrainz returned \"{matched_title}\", skipping.\n")
             continue
 
-        release_tracks = set()
-        for medium in release.get("medium-list", []):
-            for track in medium.get("track-list", []):
-                rec_title = track.get("recording", {}).get("title", "")
-                release_tracks.add(rec_title.lower().strip())
-
-        if release_tracks and title.lower().strip() not in release_tracks:
+        if release_has_titles(release) and not matching_tracks(release, title):
             print(f"         CROSS-CHECK FAIL: \"{title}\" not found in release tracklist, skipping.\n")
             continue
 
@@ -352,7 +457,7 @@ def metadata_enrichment(force=False):
 
         metadata["TITLE"] = [title]
 
-        date = release.get("date", "")
+        date = release.get("date", "") or release.get("release-group", {}).get("first-release-date", "")
         formatted_date = ""
         if date:
             formatted_date = format_date(date)

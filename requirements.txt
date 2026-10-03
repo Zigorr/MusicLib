@@ -1,4 +1,5 @@
 mutagen
 lrclibapi
 musicbrainzngs
-syncedlyrics
+miniaudio
+numpy
